@@ -3,14 +3,10 @@ package cmd
 import (
 	_ "embed"
 	"fmt"
-	"strings"
-	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/reflow/wordwrap"
 )
 
 // constrain the maximum terminal width to avoid readability issues with too
@@ -307,29 +303,10 @@ func MarkdownStyle() ansi.StyleConfig {
 	}
 }
 
-var DotsSpinner = spinner.Spinner{
-	Frames: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
-	FPS:    80 * time.Millisecond,
-}
-
-var titleStyle = lipgloss.NewStyle().Foreground(ColorPalette.BgMain).Bold(true)
-var textStyle = lipgloss.NewStyle().Foreground(ColorPalette.LabelBase)
-var addedLineStyle = lipgloss.NewStyle().Foreground(ColorPalette.LabelControl).Background(ColorPalette.BgSuccess)
-var deletedLineStyle = lipgloss.NewStyle().Background(ColorPalette.BgDanger).Foreground(ColorPalette.LabelControl)
-var containerStyle = lipgloss.NewStyle().PaddingLeft(2).PaddingTop(2)
-
 func styleH1() lipgloss.Style {
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#ffffff")).
 		Background(ColorPalette.BgMain).
-		Bold(true).
-		PaddingLeft(2).
-		PaddingRight(2)
-}
-
-func styleH2() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(ColorPalette.BgMain).
 		Bold(true).
 		PaddingLeft(2).
 		PaddingRight(2)
@@ -360,49 +337,31 @@ func markdownToString(maxWidth int, markdown string) string {
 	return out
 }
 
-// wrap ensures that the text is wrapped to the given width and everything but
-// the first line is indented by the requested amount. Consider that the current
-// implementation is very naive and for large indent values, the first line
-// might not be wrapped too early.
-//
-// Indent is ignored when the requested indent is larger than the current width.
-// This is expected to only occur in edge cases, e.g. when the terminal is
-// resiyed to very narrow.
-func wrap(s string, width, indent int) string {
-	if indent > width {
-		indent = 0
+func OkSymbol() string {
+	if IsConhost() {
+		return "OK"
 	}
-
-	return strings.ReplaceAll(wordwrap.String(s, width-indent), "\n", "\n"+strings.Repeat(" ", indent))
+	return "✔︎"
 }
 
-func RenderOk() string {
-	checkMark := "✔︎"
+func UnknownSymbol() string {
 	if IsConhost() {
-		checkMark = "OK"
+		return "??"
 	}
-	return lipgloss.NewStyle().Foreground(ColorPalette.BgSuccess).Render(checkMark)
+	return "?"
 }
 
-func RenderUnknown() string {
-	checkMark := "?"
+func ErrSymbol() string {
 	if IsConhost() {
-		checkMark = "??"
+		return "ERR"
 	}
-	return lipgloss.NewStyle().Foreground(ColorPalette.BgWarning).Render(checkMark)
+	return "✗"
 }
 
-func RenderErr() string {
-	checkMark := "✗"
+func IndentSymbol() string {
 	if IsConhost() {
-		checkMark = "ERR"
+		// because conhost symbols are wider, we also indent a space more
+		return "    "
 	}
-	return lipgloss.NewStyle().Foreground(ColorPalette.BgDanger).Render(checkMark)
-}
-
-func PlatformSpinner() spinner.Spinner {
-	if IsConhost() {
-		return spinner.Line
-	}
-	return DotsSpinner
+	return "   "
 }

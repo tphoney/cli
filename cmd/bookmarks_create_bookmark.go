@@ -8,7 +8,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -41,7 +41,7 @@ func CreateBookmark(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write"}, nil)
 	if err != nil {
 		return err
 	}
@@ -84,11 +84,6 @@ func CreateBookmark(cmd *cobra.Command, args []string) error {
 		log.WithContext(ctx).WithFields(log.Fields{
 			"bookmark-query": q,
 		}).Info("created bookmark query")
-	}
-	for _, i := range response.Msg.GetBookmark().GetProperties().GetExcludedItems() {
-		log.WithContext(ctx).WithFields(log.Fields{
-			"bookmark-excluded-item": i,
-		}).Info("created bookmark excluded item")
 	}
 
 	b, err := json.MarshalIndent(response.Msg.GetBookmark().GetProperties(), "", "  ")

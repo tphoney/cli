@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"text/template"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/hexops/gotextdiff"
 	"github.com/hexops/gotextdiff/myers"
 	diffspan "github.com/hexops/gotextdiff/span"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -37,12 +38,34 @@ var getChangeCmd = &cobra.Command{
 // to reflect the latest version
 //
 // This allows us to update the assets without fear of breaking older comments
-const assetVersion = "17c7fd2c365d4f4cdd8e414ca5148f825fa4febd"
+const assetVersion = "476f6df5bc783c17b1d0513a43e0a0aa9c075588" // tag from v1.6.1
 
 func GetChange(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"})
+	app := viper.GetString("app")
+
+	riskLevels := []sdp.Risk_Severity{}
+	for _, level := range viper.GetStringSlice("risk-levels") {
+		switch level {
+		case "high":
+			riskLevels = append(riskLevels, sdp.Risk_SEVERITY_HIGH)
+		case "medium":
+			riskLevels = append(riskLevels, sdp.Risk_SEVERITY_MEDIUM)
+		case "low":
+			riskLevels = append(riskLevels, sdp.Risk_SEVERITY_LOW)
+		default:
+			return flagError{fmt.Sprintf("invalid --risk-levels value '%v', allowed values are 'high', 'medium', 'low'", level)}
+		}
+	}
+	slices.Sort(riskLevels)
+	riskLevels = slices.Compact(riskLevels)
+
+	if len(riskLevels) == 0 {
+		riskLevels = []sdp.Risk_Severity{sdp.Risk_SEVERITY_HIGH, sdp.Risk_SEVERITY_MEDIUM, sdp.Risk_SEVERITY_LOW}
+	}
+
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"}, nil)
 	if err != nil {
 		return err
 	}
@@ -61,49 +84,45 @@ func GetChange(cmd *cobra.Command, args []string) error {
 	}
 
 	client := AuthenticatedChangesClient(ctx, oi)
-	var riskRes *connect.Response[sdp.GetChangeRisksResponse]
+	var timeLine *sdp.GetChangeTimelineV2Response
 fetch:
 	for {
-		// use err variable to avoid shadowing riskRes outside the loop
-		var err error
-		riskRes, err = client.GetChangeRisks(ctx, &connect.Request[sdp.GetChangeRisksRequest]{
-			Msg: &sdp.GetChangeRisksRequest{
-				UUID: changeUuid[:],
+		rawTimeLine, timelineErr := client.GetChangeTimelineV2(ctx, &connect.Request[sdp.GetChangeTimelineV2Request]{
+			Msg: &sdp.GetChangeTimelineV2Request{
+				ChangeUUID: changeUuid[:],
 			},
 		})
+		if timelineErr != nil || rawTimeLine.Msg == nil {
+			return loggedError{
+				err:     timelineErr,
+				fields:  lf,
+				message: "failed to get timeline",
+			}
+		}
+		timeLine = rawTimeLine.Msg
+		for _, entry := range timeLine.GetEntries() {
+			if entry.GetName() == string(sdp.ChangeTimelineEntryV2NameAutoTagging) && entry.GetStatus() == sdp.ChangeTimelineEntryStatus_DONE {
+				break fetch
+			}
+		}
+		// display the running entry
+		runningEntry, status, err := sdp.TimelineFindInProgressEntry(timeLine.GetEntries())
 		if err != nil {
 			return loggedError{
 				err:     err,
 				fields:  lf,
-				message: "failed to get change risks",
+				message: "failed to find running entry",
 			}
 		}
+		// find the running timeline entry
+		log.WithContext(ctx).WithFields(log.Fields{
+			"status":  status.String(),
+			"running": runningEntry,
+		}).Info("Waiting for change analysis to complete")
+		// retry
+		time.Sleep(3 * time.Second)
 
-		if riskRes.Msg.GetChangeRiskMetadata().GetRiskCalculationStatus().GetStatus() == sdp.RiskCalculationStatus_STATUS_INPROGRESS {
-			// Extract the currently running milestone if you can
-			milestones := riskRes.Msg.GetChangeRiskMetadata().GetRiskCalculationStatus().GetProgressMilestones()
-			var currentMilestone string
-			for _, milestone := range milestones {
-				if milestone == nil {
-					continue
-				}
-
-				if milestone.GetStatus() == sdp.RiskCalculationStatus_ProgressMilestone_STATUS_INPROGRESS {
-					currentMilestone = milestone.GetDescription()
-				}
-			}
-
-			log.WithContext(ctx).WithFields(log.Fields{
-				"status":    riskRes.Msg.GetChangeRiskMetadata().GetRiskCalculationStatus().GetStatus().String(),
-				"milestone": currentMilestone,
-			}).Info("Waiting for risk calculation")
-
-			time.Sleep(3 * time.Second)
-			// retry
-		} else {
-			// it's done (or errored)
-			break fetch
-		}
+		// check if the context is cancelled
 		if ctx.Err() != nil {
 			return loggedError{
 				err:     ctx.Err(),
@@ -112,7 +131,7 @@ fetch:
 			}
 		}
 	}
-
+	// get the change
 	changeRes, err := client.GetChange(ctx, &connect.Request[sdp.GetChangeRequest]{
 		Msg: &sdp.GetChangeRequest{
 			UUID: changeUuid[:],
@@ -133,11 +152,43 @@ fetch:
 		"change-description": changeRes.Msg.GetChange().GetProperties().GetDescription(),
 	}).Info("found change")
 
+	var calculateRiskStep *sdp.ChangeTimelineEntryV2
+	for _, entry := range timeLine.GetEntries() {
+		if entry.GetName() == string(sdp.ChangeTimelineEntryV2NameCalculatedRisks) {
+			calculateRiskStep = entry
+			break
+		}
+	}
+	if calculateRiskStep == nil || calculateRiskStep.GetCalculatedRisks() == nil {
+		return loggedError{
+			err:     fmt.Errorf("failed to find risk calculation step"),
+			fields:  lf,
+			message: "failed to find risk calculation step",
+		}
+	}
+	// filter the risks
+	calculatedRisks := calculateRiskStep.GetCalculatedRisks().GetRisks()
+	if len(riskLevels) != 3 {
+		log.WithContext(ctx).WithFields(log.Fields{
+			"risk-levels": renderRiskFilter(riskLevels),
+		}).Info("filtering risks")
+
+		calculatedRisks = filterRisks(calculatedRisks, riskLevels)
+	}
+
 	switch viper.GetString("format") {
 	case "json":
-		b, err := json.MarshalIndent(changeRes.Msg.GetChange().ToMap(), "", "  ")
+		jsonStruct := struct {
+			Change *sdp.Change `json:"change"`
+			Risks  []*sdp.Risk `json:"risks"`
+		}{
+			Change: changeRes.Msg.GetChange(),
+			Risks:  calculatedRisks,
+		}
+
+		b, err := json.MarshalIndent(jsonStruct, "", "  ")
 		if err != nil {
-			lf["input"] = fmt.Sprintf("%#v", changeRes.Msg.GetChange().ToMap())
+			lf["input"] = fmt.Sprintf("%#v", jsonStruct)
 			return loggedError{
 				err:     err,
 				fields:  lf,
@@ -148,20 +199,19 @@ fetch:
 		fmt.Println(string(b))
 	case "markdown":
 		type TemplateItem struct {
-			StatusAlt  string
-			StatusIcon string
-			Type       string
-			Title      string
-			Diff       string
+			StatusSymbol string
+			Type         string
+			Title        string
+			Diff         string
 		}
 		type TemplateRisk struct {
-			SeverityAlt  string
-			SeverityIcon string
 			SeverityText string
 			Title        string
 			Description  string
+			RiskUrl      string
 		}
 		type TemplateData struct {
+			BlastRadiusUrl  string
 			ChangeUrl       string
 			ExpectedChanges []TemplateItem
 			UnmappedChanges []TemplateItem
@@ -170,59 +220,47 @@ fetch:
 			Risks           []TemplateRisk
 			// Path to the assets folder on github
 			AssetPath string
+			TagsLine  string
 		}
 		status := map[sdp.ItemDiffStatus]TemplateItem{
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UNSPECIFIED: {
-				StatusAlt:  "unspecified",
-				StatusIcon: "",
+				StatusSymbol: "-",
 			},
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UNCHANGED: {
-				StatusAlt:  "unchanged",
-				StatusIcon: "item.svg",
+				StatusSymbol: "✓",
 			},
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_CREATED: {
-				StatusAlt:  "created",
-				StatusIcon: "created.svg",
+				StatusSymbol: "+",
 			},
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UPDATED: {
-				StatusAlt:  "updated",
-				StatusIcon: "changed.svg",
+				StatusSymbol: "~",
 			},
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_DELETED: {
-				StatusAlt:  "deleted",
-				StatusIcon: "deleted.svg",
+				StatusSymbol: "-",
 			},
 			sdp.ItemDiffStatus_ITEM_DIFF_STATUS_REPLACED: {
-				StatusAlt:  "replaced",
-				StatusIcon: "replaced.svg",
+				StatusSymbol: "+/-",
 			},
 		}
 
 		severity := map[sdp.Risk_Severity]TemplateRisk{
 			sdp.Risk_SEVERITY_UNSPECIFIED: {
-				SeverityAlt:  "unspecified",
-				SeverityIcon: "",
 				SeverityText: "unspecified",
 			},
 			sdp.Risk_SEVERITY_LOW: {
-				SeverityAlt:  "low",
-				SeverityIcon: "low.svg",
 				SeverityText: "Low",
 			},
 			sdp.Risk_SEVERITY_MEDIUM: {
-				SeverityAlt:  "medium",
-				SeverityIcon: "medium.svg",
-				SeverityText: "Medium",
+				SeverityText: "❗Medium",
 			},
 			sdp.Risk_SEVERITY_HIGH: {
-				SeverityAlt:  "high",
-				SeverityIcon: "high.svg",
-				SeverityText: "High",
+				SeverityText: "‼️High",
 			},
 		}
-		frontend, _ := strings.CutSuffix(viper.GetString("frontend"), "/")
+		app, _ = strings.CutSuffix(app, "/")
 		data := TemplateData{
-			ChangeUrl:       fmt.Sprintf("%v/changes/%v", frontend, changeUuid.String()),
+			ChangeUrl:       fmt.Sprintf("%v/changes/%v", app, changeUuid.String()),
+			BlastRadiusUrl:  fmt.Sprintf("%v/changes/%v/blast-radius", app, changeUuid.String()),
 			ExpectedChanges: []TemplateItem{},
 			UnmappedChanges: []TemplateItem{},
 			BlastItems:      int(changeRes.Msg.GetChange().GetMetadata().GetNumAffectedItems()),
@@ -256,11 +294,10 @@ fetch:
 
 			if item.GetItem() != nil {
 				data.ExpectedChanges = append(data.ExpectedChanges, TemplateItem{
-					StatusAlt:  status[item.GetStatus()].StatusAlt,
-					StatusIcon: status[item.GetStatus()].StatusIcon,
-					Type:       item.GetItem().GetType(),
-					Title:      item.GetItem().GetUniqueAttributeValue(),
-					Diff:       diff,
+					StatusSymbol: status[item.GetStatus()].StatusSymbol,
+					Type:         item.GetItem().GetType(),
+					Title:        item.GetItem().GetUniqueAttributeValue(),
+					Diff:         diff,
 				})
 			} else {
 				var typ, title string
@@ -272,24 +309,27 @@ fetch:
 					title = item.GetBefore().UniqueAttributeValue()
 				}
 				data.UnmappedChanges = append(data.UnmappedChanges, TemplateItem{
-					StatusAlt:  status[item.GetStatus()].StatusAlt,
-					StatusIcon: status[item.GetStatus()].StatusIcon,
-					Type:       typ,
-					Title:      title,
-					Diff:       diff,
+					StatusSymbol: status[item.GetStatus()].StatusSymbol,
+					Type:         typ,
+					Title:        title,
+					Diff:         diff,
 				})
 			}
 		}
 
-		for _, risk := range riskRes.Msg.GetChangeRiskMetadata().GetRisks() {
+		for _, risk := range calculatedRisks {
+			// parse the risk UUID to a string
+			riskUuid, _ := uuid.FromBytes(risk.GetUUID())
 			data.Risks = append(data.Risks, TemplateRisk{
-				SeverityAlt:  severity[risk.GetSeverity()].SeverityAlt,
-				SeverityIcon: severity[risk.GetSeverity()].SeverityIcon,
 				SeverityText: severity[risk.GetSeverity()].SeverityText,
 				Title:        risk.GetTitle(),
 				Description:  risk.GetDescription(),
+				RiskUrl:      fmt.Sprintf("%v/changes/%v/blast-radius?selectedRisk=%v&activeTab=risks", app, changeUuid.String(), riskUuid.String()),
 			})
 		}
+		// get the tags in
+		data.TagsLine = getTagsLine(changeRes.Msg.GetChange().GetProperties().GetEnrichedTags().GetTagValue())
+		data.TagsLine = strings.TrimSpace(data.TagsLine)
 
 		tmpl, err := template.New("comment").Parse(commentTemplate)
 		if err != nil {
@@ -313,12 +353,70 @@ fetch:
 	return nil
 }
 
+func filterRisks(risks []*sdp.Risk, levels []sdp.Risk_Severity) []*sdp.Risk {
+	filteredRisks := make([]*sdp.Risk, 0)
+
+	for _, risk := range risks {
+		if slices.Contains(levels, risk.GetSeverity()) {
+			filteredRisks = append(filteredRisks, risk)
+		}
+	}
+
+	return filteredRisks
+}
+
+func renderRiskFilter(levels []sdp.Risk_Severity) string {
+	result := make([]string, 0, len(levels))
+	for _, level := range levels {
+		switch level {
+		case sdp.Risk_SEVERITY_HIGH:
+			result = append(result, "high")
+		case sdp.Risk_SEVERITY_MEDIUM:
+			result = append(result, "medium")
+		case sdp.Risk_SEVERITY_LOW:
+			result = append(result, "low")
+		case sdp.Risk_SEVERITY_UNSPECIFIED:
+			continue
+		}
+	}
+	return strings.Join(result, ", ")
+}
+
+func getTagsLine(tags map[string]*sdp.TagValue) string {
+	autoTags := ""
+	userTags := ""
+
+	for key, value := range tags {
+		if value.GetAutoTagValue() != nil {
+			suffix := ""
+			if value.GetAutoTagValue().GetValue() != "" {
+				suffix = fmt.Sprintf("|%s", value.GetAutoTagValue().GetValue())
+			}
+			autoTags += fmt.Sprintf("`✨%s%s` ", key, suffix)
+		} else if value.GetUserTagValue() != nil {
+			suffix := ""
+			if value.GetUserTagValue().GetValue() != "" {
+				suffix = fmt.Sprintf("|%s", value.GetUserTagValue().GetValue())
+			}
+			userTags += fmt.Sprintf("`%s%s` ", key, suffix)
+		} else {
+			// we should never get here, but just in case.
+			// its a tag jim, but not as we know it
+			userTags += fmt.Sprintf("`%s` ", key)
+		}
+	}
+	return autoTags + userTags
+}
+
 func init() {
 	changesCmd.AddCommand(getChangeCmd)
+	addAPIFlags(getChangeCmd)
 
 	addChangeUuidFlags(getChangeCmd)
-	getChangeCmd.PersistentFlags().String("status", "", "The expected status of the change. Use this with --ticket-link. Allowed values: CHANGE_STATUS_UNSPECIFIED, CHANGE_STATUS_DEFINING, CHANGE_STATUS_HAPPENING, CHANGE_STATUS_PROCESSING, CHANGE_STATUS_DONE")
+	getChangeCmd.PersistentFlags().String("status", "CHANGE_STATUS_DEFINING", "The expected status of the change. Use this with --ticket-link to get the first change with that status for a given ticket link. Allowed values: CHANGE_STATUS_UNSPECIFIED, CHANGE_STATUS_DEFINING, CHANGE_STATUS_HAPPENING, CHANGE_STATUS_PROCESSING, CHANGE_STATUS_DONE")
 
-	getChangeCmd.PersistentFlags().String("frontend", "https://app.overmind.tech/", "The frontend base URL")
+	getChangeCmd.PersistentFlags().String("frontend", "", "The frontend base URL")
+	_ = submitPlanCmd.PersistentFlags().MarkDeprecated("frontend", "This flag is no longer used and will be removed in a future release. Use the '--app' flag instead.") // MarkDeprecated only errors if the flag doesn't exist, we fall back to using app
 	getChangeCmd.PersistentFlags().String("format", "json", "How to render the change. Possible values: json, markdown")
+	getChangeCmd.PersistentFlags().StringSlice("risk-levels", []string{"high", "medium", "low"}, "Only show changes with the specified risk levels. Allowed values: high, medium, low")
 }

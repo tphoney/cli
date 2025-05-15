@@ -6,7 +6,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -30,7 +30,7 @@ func GetBookmark(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"}, nil)
 	if err != nil {
 		return err
 	}

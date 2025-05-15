@@ -8,7 +8,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -25,7 +25,7 @@ var listChangesCmd = &cobra.Command{
 func ListChanges(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:read"}, nil)
 	if err != nil {
 		return err
 	}
@@ -236,6 +236,18 @@ func printJson(_ context.Context, b []byte, prefix, id string, cmd *cobra.Comman
 		dir := viper.GetString("dir")
 		if dir == "" {
 			return flagError{fmt.Sprintf("need --dir value to write to files\n\n%v", cmd.UsageString())}
+		}
+
+		// attempt to create the directory
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return loggedError{
+				err: err,
+				fields: log.Fields{
+					"output-dir": dir,
+				},
+				message: "failed to create output directory",
+			}
 		}
 
 		// write the change to a file

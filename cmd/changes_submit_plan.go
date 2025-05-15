@@ -2,23 +2,20 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
-	"slices"
 	"strings"
-	"time"
 
 	"connectrpc.com/connect"
-	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/tfutils"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // submitPlanCmd represents the submit-plan command
@@ -47,348 +44,6 @@ type TfData struct {
 	Values  map[string]any
 }
 
-// maskAllData masks every entry in attributes as redacted
-func maskAllData(attributes map[string]any) map[string]any {
-	for k, v := range attributes {
-		if mv, ok := v.(map[string]any); ok {
-			attributes[k] = maskAllData(mv)
-		} else {
-			attributes[k] = "REDACTED"
-		}
-	}
-	return attributes
-}
-
-// maskSensitiveData masks every entry in attributes that is set to true in sensitive. returns the redacted attributes
-func maskSensitiveData(attributes, sensitive any) any {
-	if sensitive == true {
-		return "REDACTED"
-	} else if sensitiveMap, ok := sensitive.(map[string]any); ok {
-		if attributesMap, ok := attributes.(map[string]any); ok {
-			result := map[string]any{}
-			for k, v := range attributesMap {
-				result[k] = maskSensitiveData(v, sensitiveMap[k])
-			}
-			return result
-		} else {
-			return "REDACTED (type mismatch)"
-		}
-	} else if sensitiveArr, ok := sensitive.([]any); ok {
-		if attributesArr, ok := attributes.([]any); ok {
-			if len(sensitiveArr) != len(attributesArr) {
-				return "REDACTED (len mismatch)"
-			}
-			result := make([]any, len(attributesArr))
-			for i, v := range attributesArr {
-				result[i] = maskSensitiveData(v, sensitiveArr[i])
-			}
-			return result
-		} else {
-			return "REDACTED (type mismatch)"
-		}
-	}
-	return attributes
-}
-
-func itemAttributesFromResourceChangeData(attributesMsg, sensitiveMsg json.RawMessage) (*sdp.ItemAttributes, error) {
-	var attributes map[string]any
-	err := json.Unmarshal(attributesMsg, &attributes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse attributes: %w", err)
-	}
-
-	// sensitiveMsg can be a bool or a map[string]any
-	var isSensitive bool
-	err = json.Unmarshal(sensitiveMsg, &isSensitive)
-	if err == nil && isSensitive {
-		attributes = maskAllData(attributes)
-	} else if err != nil {
-		// only try parsing as map if parsing as bool failed
-		var sensitive map[string]any
-		err = json.Unmarshal(sensitiveMsg, &sensitive)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse sensitive: %w", err)
-		}
-		attributes = maskSensitiveData(attributes, sensitive).(map[string]any)
-	}
-
-	return sdp.ToAttributesSorted(attributes)
-}
-
-// Converts a ResourceChange form a terraform plan to an ItemDiff in SDP format.
-// These items will use the scope `terraform_plan` since we haven't mapped them
-// to an actual item in the infrastructure yet
-func itemDiffFromResourceChange(resourceChange ResourceChange) (*sdp.ItemDiff, error) {
-	status := sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UNSPECIFIED
-
-	if slices.Equal(resourceChange.Change.Actions, []string{"no-op"}) || slices.Equal(resourceChange.Change.Actions, []string{"read"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UNCHANGED
-	} else if slices.Equal(resourceChange.Change.Actions, []string{"create"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_CREATED
-	} else if slices.Equal(resourceChange.Change.Actions, []string{"update"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_UPDATED
-	} else if slices.Equal(resourceChange.Change.Actions, []string{"delete", "create"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_REPLACED
-	} else if slices.Equal(resourceChange.Change.Actions, []string{"create", "delete"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_REPLACED
-	} else if slices.Equal(resourceChange.Change.Actions, []string{"delete"}) {
-		status = sdp.ItemDiffStatus_ITEM_DIFF_STATUS_DELETED
-	}
-
-	beforeAttributes, err := itemAttributesFromResourceChangeData(resourceChange.Change.Before, resourceChange.Change.BeforeSensitive)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse before attributes: %w", err)
-	}
-	afterAttributes, err := itemAttributesFromResourceChangeData(resourceChange.Change.After, resourceChange.Change.AfterSensitive)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse after attributes: %w", err)
-	}
-
-	err = removeKnownAfterApply(beforeAttributes, afterAttributes, resourceChange.Change.AfterUnknown)
-	if err != nil {
-		return nil, fmt.Errorf("failed to remove known after apply fields: %w", err)
-	}
-
-	result := &sdp.ItemDiff{
-		// Item: filled in by item mapping in UpdatePlannedChanges
-		Status: status,
-	}
-
-	// shorten the address by removing the type prefix if and only if it is the
-	// first part. Longer terraform addresses created in modules will not be
-	// shortened to avoid confusion.
-	trimmedAddress, _ := strings.CutPrefix(resourceChange.Address, fmt.Sprintf("%v.", resourceChange.Type))
-
-	if beforeAttributes != nil {
-		result.Before = &sdp.Item{
-			Type:            resourceChange.Type,
-			UniqueAttribute: "terraform_name",
-			Attributes:      beforeAttributes,
-			Scope:           "terraform_plan",
-		}
-
-		err = result.GetBefore().GetAttributes().Set("terraform_name", trimmedAddress)
-		if err != nil {
-			// since Address is a string, this should never happen
-			sentry.CaptureException(fmt.Errorf("failed to set terraform_name '%v' on before attributes: %w", trimmedAddress, err))
-		}
-
-		err = result.GetBefore().GetAttributes().Set("terraform_address", resourceChange.Address)
-		if err != nil {
-			// since Address is a string, this should never happen
-			sentry.CaptureException(fmt.Errorf("failed to set terraform_address of type %T (%v) on before attributes: %w", resourceChange.Address, resourceChange.Address, err))
-		}
-	}
-
-	if afterAttributes != nil {
-		result.After = &sdp.Item{
-			Type:            resourceChange.Type,
-			UniqueAttribute: "terraform_name",
-			Attributes:      afterAttributes,
-			Scope:           "terraform_plan",
-		}
-
-		err = result.GetAfter().GetAttributes().Set("terraform_name", trimmedAddress)
-		if err != nil {
-			// since Address is a string, this should never happen
-			sentry.CaptureException(fmt.Errorf("failed to set terraform_name '%v' on after attributes: %w", trimmedAddress, err))
-		}
-
-		err = result.GetAfter().GetAttributes().Set("terraform_address", resourceChange.Address)
-		if err != nil {
-			// since Address is a string, this should never happen
-			sentry.CaptureException(fmt.Errorf("failed to set terraform_address of type %T (%v) on after attributes: %w", resourceChange.Address, resourceChange.Address, err))
-		}
-	}
-
-	return result, nil
-}
-
-// Removes fields from the `before` and `after` attributes that are known after
-// apply. This is because these fields are not "real" changes and we don't want
-// to show them in the UI
-func removeKnownAfterApply(before, after *sdp.ItemAttributes, afterUnknown json.RawMessage) error {
-	var afterUnknownInterface interface{}
-	err := json.Unmarshal(afterUnknown, &afterUnknownInterface)
-	if err != nil {
-		return fmt.Errorf("could not unmarshal `after_unknown` from plan: %w", err)
-	}
-
-	// Convert the parent struct to a value so that we can treat them all the
-	// same when we recurse
-	beforeValue := structpb.Value{
-		Kind: &structpb.Value_StructValue{
-			StructValue: before.GetAttrStruct(),
-		},
-	}
-
-	afterValue := structpb.Value{
-		Kind: &structpb.Value_StructValue{
-			StructValue: after.GetAttrStruct(),
-		},
-	}
-
-	err = removeUnknownFields(&beforeValue, &afterValue, afterUnknownInterface)
-
-	if err != nil {
-		return fmt.Errorf("failed to remove known after apply fields: %w", err)
-	}
-
-	return nil
-}
-
-// Recursively remove fields from the before and after values that are known
-// after apply. This is done by comparing the afterUnknown interface to the
-// before and after values and removing the fields that are true.
-//
-// AfterUnknown is an object value with similar structure to After, but with all
-// unknown leaf values replaced with true, and all known leaf values omitted.
-// This can be combined with After to reconstruct a full value after the action,
-// including values which will only be known after apply.
-func removeUnknownFields(before, after *structpb.Value, afterUnknown interface{}) error {
-	switch afterUnknown.(type) {
-	case map[string]interface{}:
-		for k, v := range afterUnknown.(map[string]interface{}) {
-			if v == true {
-				delete(before.GetStructValue().GetFields(), k)
-				delete(after.GetStructValue().GetFields(), k)
-			} else if v == false {
-				// Do nothing
-				continue
-			} else {
-				// Recurse into the nested fields
-				err := removeUnknownFields(before.GetStructValue().GetFields()[k], after.GetStructValue().GetFields()[k], v)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	case []interface{}:
-		for i, v := range afterUnknown.([]interface{}) {
-			if v == true {
-				// If this value in a slice is true, remove the corresponding
-				// values from the before and after
-				if before.GetListValue() != nil && len(before.GetListValue().GetValues()) > i {
-					before.GetListValue().Values = append(before.GetListValue().GetValues()[:i], before.GetListValue().GetValues()[i+1:]...)
-				}
-				if after.GetListValue() != nil && len(after.GetListValue().GetValues()) > i {
-					after.GetListValue().Values = append(after.GetListValue().GetValues()[:i], after.GetListValue().GetValues()[i+1:]...)
-				}
-			} else if v == false {
-				// Do nothing
-				continue
-			} else {
-				// Make sure that the before and after both actually have a
-				// valid list item at this position, if they don't we can just
-				// pass `nil` to the `removeUnknownFields` function and it'll
-				// handle it
-				beforeListValues := before.GetListValue().GetValues()
-				afterListValues := after.GetListValue().GetValues()
-				var nestedBeforeValue *structpb.Value
-				var nestedAfterValue *structpb.Value
-
-				if len(beforeListValues) > i {
-					nestedBeforeValue = beforeListValues[i]
-				}
-
-				if len(afterListValues) > i {
-					nestedAfterValue = afterListValues[i]
-				}
-
-				err := removeUnknownFields(nestedBeforeValue, nestedAfterValue, v)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	default:
-		return nil
-	}
-
-	return nil
-}
-
-type plannedChangeGroups struct {
-	supported   map[string][]*sdp.MappedItemDiff
-	unsupported map[string][]*sdp.MappedItemDiff
-}
-
-func (g *plannedChangeGroups) NumUnsupportedChanges() int {
-	num := 0
-
-	for _, v := range g.unsupported {
-		num += len(v)
-	}
-
-	return num
-}
-
-func (g *plannedChangeGroups) NumSupportedChanges() int {
-	num := 0
-
-	for _, v := range g.supported {
-		num += len(v)
-	}
-
-	return num
-}
-
-func (g *plannedChangeGroups) MappedItemDiffs() []*sdp.MappedItemDiff {
-	mappedItemDiffs := make([]*sdp.MappedItemDiff, 0)
-
-	for _, v := range g.supported {
-		mappedItemDiffs = append(mappedItemDiffs, v...)
-	}
-
-	for _, v := range g.unsupported {
-		mappedItemDiffs = append(mappedItemDiffs, v...)
-	}
-
-	return mappedItemDiffs
-}
-
-// Add the specified item to the appropriate type group in the supported or unsupported section, based of whether it has a mapping query
-func (g *plannedChangeGroups) Add(typ string, item *sdp.MappedItemDiff) {
-	groups := g.supported
-	if item.GetMappingQuery() == nil {
-		groups = g.unsupported
-	}
-	list, ok := groups[typ]
-	if !ok {
-		list = make([]*sdp.MappedItemDiff, 0)
-	}
-	groups[typ] = append(list, item)
-}
-
-// Checks if the supplied JSON bytes are a state file. It's a common  mistake to
-// pass a state file to Overmind rather than a plan file since the commands to
-// create them are similar
-func isStateFile(bytes []byte) bool {
-	fields := make(map[string]interface{})
-
-	err := json.Unmarshal(bytes, &fields)
-
-	if err != nil {
-		return false
-	}
-
-	if _, exists := fields["values"]; exists {
-		return true
-	}
-
-	return false
-}
-
-// Returns the name of the provider from the config key. If the resource isn't
-// in a module, the ProviderConfigKey will be something like "kubernetes",
-// however if it's in a module it's be something like
-// "module.something:kubernetes". In both scenarios we want to return
-// "kubernetes"
-func extractProviderNameFromConfigKey(providerConfigKey string) string {
-	sections := strings.Split(providerConfigKey, ":")
-	return sections[len(sections)-1]
-}
-
 func changeTitle(arg string) string {
 	if arg != "" {
 		// easy, return the user's choice
@@ -411,8 +66,9 @@ func changeTitle(arg string) string {
 	if err != nil {
 		log.WithError(err).Trace("failed to get current user for default title")
 		username = "unknown"
+	} else {
+		username = u.Username
 	}
-	username = u.Username
 
 	result := fmt.Sprintf("Deployment from %v by %v", describe, username)
 	log.WithField("generated-title", result).Debug("Using default title")
@@ -436,7 +92,9 @@ func tryLoadText(ctx context.Context, fileName string) string {
 func SubmitPlan(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write"})
+	app := viper.GetString("app")
+
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write", "sources:read"}, nil)
 	if err != nil {
 		return err
 	}
@@ -453,7 +111,7 @@ func SubmitPlan(cmd *cobra.Command, args []string) error {
 	lf := log.Fields{}
 	for _, f := range args {
 		lf["file"] = f
-		result, err := mappedItemDiffsFromPlanFile(ctx, f, lf)
+		result, err := tfutils.MappedItemDiffsFromPlanFile(ctx, f, lf)
 		if err != nil {
 			return loggedError{
 				err:     err,
@@ -478,20 +136,40 @@ func SubmitPlan(cmd *cobra.Command, args []string) error {
 	title := changeTitle(viper.GetString("title"))
 	tfPlanOutput := tryLoadText(ctx, viper.GetString("terraform-plan-output"))
 	codeChangesOutput := tryLoadText(ctx, viper.GetString("code-changes-diff"))
+	// Detect the repository URL if it wasn't provided
+	repoUrl := viper.GetString("repo")
+	if repoUrl == "" {
+		repoUrl, err = DetectRepoURL(AllDetectors)
+		if err != nil {
+			log.WithContext(ctx).WithError(err).WithFields(lf).Debug("Failed to detect repository URL. Use the --repo flag to specify it manually if you require it")
+		}
+	}
+	enrichedTags, err := parseTagsArgument()
+	if err != nil {
+		return loggedError{
+			err:     err,
+			fields:  lf,
+			message: "Failed to parse tags",
+		}
+	}
+
+	properties := &sdp.ChangeProperties{
+		Title:        title,
+		Description:  viper.GetString("description"),
+		TicketLink:   viper.GetString("ticket-link"),
+		Owner:        viper.GetString("owner"),
+		RawPlan:      tfPlanOutput,
+		CodeChanges:  codeChangesOutput,
+		Repo:         repoUrl,
+		EnrichedTags: enrichedTags,
+	}
 
 	if changeUuid == uuid.Nil {
 		log.WithContext(ctx).WithFields(lf).Debug("Creating a new change")
+
 		createResponse, err := client.CreateChange(ctx, &connect.Request[sdp.CreateChangeRequest]{
 			Msg: &sdp.CreateChangeRequest{
-				Properties: &sdp.ChangeProperties{
-					Title:       title,
-					Description: viper.GetString("description"),
-					TicketLink:  viper.GetString("ticket-link"),
-					Owner:       viper.GetString("owner"),
-					// CcEmails:                  viper.GetString("cc-emails"),
-					RawPlan:     tfPlanOutput,
-					CodeChanges: codeChangesOutput,
-				},
+				Properties: properties,
 			},
 		})
 		if err != nil {
@@ -520,16 +198,8 @@ func SubmitPlan(cmd *cobra.Command, args []string) error {
 
 		_, err := client.UpdateChange(ctx, &connect.Request[sdp.UpdateChangeRequest]{
 			Msg: &sdp.UpdateChangeRequest{
-				UUID: changeUuid[:],
-				Properties: &sdp.ChangeProperties{
-					Title:       title,
-					Description: viper.GetString("description"),
-					TicketLink:  viper.GetString("ticket-link"),
-					Owner:       viper.GetString("owner"),
-					// CcEmails:                  viper.GetString("cc-emails"),
-					RawPlan:     tfPlanOutput,
-					CodeChanges: codeChangesOutput,
-				},
+				UUID:       changeUuid[:],
+				Properties: properties,
 			},
 		})
 		if err != nil {
@@ -543,88 +213,130 @@ func SubmitPlan(cmd *cobra.Command, args []string) error {
 		log.WithContext(ctx).WithFields(lf).Info("Re-using change")
 	}
 
-	resultStream, err := client.UpdatePlannedChanges(ctx, &connect.Request[sdp.UpdatePlannedChangesRequest]{
-		Msg: &sdp.UpdatePlannedChangesRequest{
-			ChangeUUID:    changeUuid[:],
-			ChangingItems: plannedChanges,
+	// Set up the blast radius preset if specified
+	maxDepth := viper.GetInt32("blast-radius-link-depth")
+	maxItems := viper.GetInt32("blast-radius-max-items")
+	var blastRadiusConfigOverride *sdp.BlastRadiusConfig
+	if maxDepth > 0 || maxItems > 0 {
+		blastRadiusConfigOverride = &sdp.BlastRadiusConfig{
+			MaxItems:  maxItems,
+			LinkDepth: maxDepth,
+		}
+	}
+
+	// Set up the local auto-tag rules if specified, or found in the default location
+	// order of precedence: flag > default config file
+	autoTagRulesPath := viper.GetString("auto-tag-rules")
+	autoTaggingRulesOverride, err := checkForAndLoadAutoTagRulesFile(ctx, lf, autoTagRulesPath)
+	if err != nil {
+		return loggedError{
+			err:     err,
+			fields:  lf,
+			message: "Failed to load auto-tag rules",
+		}
+	}
+
+	_, err = client.StartChangeAnalysis(ctx, &connect.Request[sdp.StartChangeAnalysisRequest]{
+		Msg: &sdp.StartChangeAnalysisRequest{
+			ChangeUUID:                changeUuid[:],
+			ChangingItems:             plannedChanges,
+			BlastRadiusConfigOverride: blastRadiusConfigOverride,
+			AutoTaggingRulesOverride:  autoTaggingRulesOverride,
 		},
 	})
 	if err != nil {
 		return loggedError{
 			err:     err,
 			fields:  lf,
-			message: "Failed to update planned changes",
+			message: "Failed to start change analysis",
 		}
 	}
 
-	last_log := time.Now()
-	first_log := true
-	for resultStream.Receive() {
-		msg := resultStream.Msg()
-
-		// log the first message and at most every 250ms during discovery
-		// to avoid spanning the cli output
-		time_since_last_log := time.Since(last_log)
-		if first_log || msg.GetState() != sdp.CalculateBlastRadiusResponse_STATE_DISCOVERING || time_since_last_log > 250*time.Millisecond {
-			log.WithContext(ctx).WithFields(lf).WithField("msg", msg).Info("Status update")
-			last_log = time.Now()
-			first_log = false
-		}
-	}
-	if resultStream.Err() != nil {
-		return loggedError{
-			err:     resultStream.Err(),
-			fields:  lf,
-			message: "Error streaming results",
-		}
-	}
-
-	frontend, _ := strings.CutSuffix(viper.GetString("frontend"), "/")
-	changeUrl := fmt.Sprintf("%v/changes/%v/blast-radius", frontend, changeUuid)
+	app, _ = strings.CutSuffix(app, "/")
+	changeUrl := fmt.Sprintf("%v/changes/%v/blast-radius", app, changeUuid)
 	log.WithContext(ctx).WithFields(lf).WithField("change-url", changeUrl).Info("Change ready")
 	fmt.Println(changeUrl)
 
-	fetchResponse, err := client.GetChange(ctx, &connect.Request[sdp.GetChangeRequest]{
-		Msg: &sdp.GetChangeRequest{
-			UUID: changeUuid[:],
-		},
-	})
-	if err != nil {
-		log.WithContext(ctx).WithFields(lf).WithError(err).Error("")
-		return loggedError{
-			err:     err,
-			fields:  lf,
-			message: "Failed to get updated change",
-		}
-	}
-
-	for _, a := range fetchResponse.Msg.GetChange().GetProperties().GetAffectedAppsUUID() {
-		appUuid, err := uuid.FromBytes(a)
-		if err != nil {
-			log.WithContext(ctx).WithFields(lf).WithError(err).WithField("app", a).Error("Received invalid app uuid")
-			continue
-		}
-		log.WithContext(ctx).WithFields(lf).WithFields(log.Fields{
-			"change-url": changeUrl,
-			"app":        appUuid,
-			"app-url":    fmt.Sprintf("%v/apps/%v", frontend, appUuid),
-		}).Info("Affected app")
-	}
-
 	return nil
+}
+
+func loadAutoTagRulesFile(autoTagRulesPath string) ([]*sdp.RuleProperties, error) {
+	// check if the file exists
+	_, err := os.Stat(autoTagRulesPath)
+	if err != nil {
+		return nil, fmt.Errorf("Auto-tag rules file %q does not exist: %w", autoTagRulesPath, err)
+	}
+	// read the file
+	autoTagRules, err := os.ReadFile(autoTagRulesPath)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read auto-tag rules file %q: %w", autoTagRulesPath, err)
+	}
+	autoTaggingRulesOverride, err := sdp.YamlStringToRuleProperties(string(autoTagRules))
+	if err != nil {
+		return nil, fmt.Errorf("Failed to parse auto-tag rules file %q: %w", autoTagRulesPath, err)
+	}
+	if len(autoTaggingRulesOverride) > 10 {
+		return nil, errors.New("Auto-tag rules file contains more than 10 rules")
+	}
+	return autoTaggingRulesOverride, nil
+}
+
+// order of precedence: flag > default config file
+func checkForAndLoadAutoTagRulesFile(ctx context.Context, lf log.Fields, manualPath string) ([]*sdp.RuleProperties, error) {
+	foundPath := ""
+	if manualPath != "" {
+		_, err := os.Stat(manualPath)
+		if err == nil {
+			// we found the file
+			foundPath = manualPath
+		} else {
+			// the specified file does not exist
+			// hard fail
+			lf["autoTagRules"] = manualPath
+			err = fmt.Errorf("Auto-tag rules file does not exist: %w", err)
+			return nil, err
+		}
+	}
+	// lets look for the default files
+	if foundPath == "" {
+		_, err := os.Stat(".overmind/auto-tag-rules.yaml")
+		if err == nil {
+			// we found the file
+			foundPath = ".overmind/auto-tag-rules.yaml"
+		}
+	}
+	if foundPath == "" {
+		_, err := os.Stat(".overmind/auto-tag-rules.yml")
+		if err == nil {
+			// we found the file
+			foundPath = ".overmind/auto-tag-rules.yml"
+		}
+	}
+
+	if foundPath != "" {
+		// we found a file, load it
+		lf["autoTagRules"] = foundPath
+		log.WithContext(ctx).WithFields(lf).Info("Loading auto-tag rules")
+		autoTaggingRulesOverride, err := loadAutoTagRulesFile(foundPath)
+		if err != nil {
+			return nil, err
+		}
+		return autoTaggingRulesOverride, nil
+	}
+	// we didn't find any files, thats ok
+	return nil, nil
 }
 
 func init() {
 	changesCmd.AddCommand(submitPlanCmd)
 
-	submitPlanCmd.PersistentFlags().String("frontend", "https://app.overmind.tech", "The frontend base URL")
+	addAPIFlags(submitPlanCmd)
+	addChangeCreationFlags(submitPlanCmd)
 
-	submitPlanCmd.PersistentFlags().String("title", "", "Short title for this change. If this is not specified, overmind will try to come up with one for you.")
-	submitPlanCmd.PersistentFlags().String("description", "", "Quick description of the change.")
-	submitPlanCmd.PersistentFlags().String("ticket-link", "*", "Link to the ticket for this change.")
-	submitPlanCmd.PersistentFlags().String("owner", "", "The owner of this change.")
-	// submitPlanCmd.PersistentFlags().String("cc-emails", "", "A comma-separated list of emails to keep updated with the status of this change.")
+	submitPlanCmd.PersistentFlags().String("frontend", "", "The frontend base URL")
+	_ = submitPlanCmd.PersistentFlags().MarkDeprecated("frontend", "This flag is no longer used and will be removed in a future release. Use the '--app' flag instead.") // MarkDeprecated only errors if the flag doesn't exist, we fall back to using app
 
-	submitPlanCmd.PersistentFlags().String("terraform-plan-output", "", "Filename of cached terraform plan output for this change.")
-	submitPlanCmd.PersistentFlags().String("code-changes-diff", "", "Fileame of the code diff of this change.")
+	submitPlanCmd.PersistentFlags().Int32("blast-radius-link-depth", 0, "Used in combination with '--blast-radius-max-items' to customise how many levels are traversed when calculating the blast radius. Larger numbers will result in a more comprehensive blast radius, but may take longer to calculate. Defaults to the account level settings.")
+	submitPlanCmd.PersistentFlags().Int32("blast-radius-max-items", 0, "Used in combination with '--blast-radius-link-depth' to customise how many items are included in the blast radius. Larger numbers will result in a more comprehensive blast radius, but may take longer to calculate. Defaults to the account level settings.")
+	submitPlanCmd.PersistentFlags().String("auto-tag-rules", "", "The path to the auto-tag rules file. If not provided, it will check the default location which is '.overmind/auto-tag-rules.yaml'. If no rules are found locally, the rules configured through the UI are used.")
 }

@@ -1,34 +1,66 @@
-{{ $top := . -}}
-# <img width="24" alt="mapped" src="{{ .AssetPath }}/item.svg"> Expected Changes
+<p align="center">
+  <img alt="Overmind" src="{{ .AssetPath }}/logo.png" width="124px" align="center">
+    <h3 align="center">
+      <a href="{{ .ChangeUrl }}">Open in Overmind ↗  </a>
+   </h3>
+</p>
+
+---
+
+{{ if .TagsLine -}}
+ {{ .TagsLine }}
+{{ end -}}
+
+<h3>🔥 Risks</h3>
+
+{{ if not .Risks }}
+
+> [!NOTE] > **Overmind has not identified any risks associated with this change**
+> This could be due to the change being low risk with no impact on other parts of the system, or involving resources that Overmind currently does not support.
+
+{{ else -}}
+{{ range .Risks }}
+**{{ .Title }}** `{{.SeverityText }}`  [Open Risk ↗]({{ .RiskUrl }})
+{{ .Description }}
+
+{{ end }}
+{{ end -}}
+
+---
+
+<h3>🟣 Expected Changes</h3>
 
 {{ range .ExpectedChanges -}}
+
 <details>
-<summary><img width="14" alt="{{ .StatusAlt }}" src="{{ $top.AssetPath }}/{{ .StatusIcon }}"> {{ .Type }} › {{ .Title }}</summary>
+<summary> {{ .StatusSymbol }} {{ .Type }} › {{ .Title }}</summary>
 
 {{ if .Diff -}}
+
 ```diff
 {{ .Diff }}
 ```
 
 {{ else -}}
-(no changed attributes)
+_No changed attributes_
 {{ end -}}
 
 </details>
 {{ else -}}
-No expected changes found.
+> [!NOTE]
+> **No expected changes found.**
 {{ end }}
 
-{{ if .UnmappedChanges -}}
-## <img width="20" alt="unmapped" src="{{ .AssetPath }}/unmapped.svg"> Unmapped Changes
+---
 
-> [!NOTE]
-> These changes couldn't be mapped to a discoverable cloud resource and therefore won't be included in the blast radius calculation.
+{{ if .UnmappedChanges -}}
+
+<h3>🟠 Unmapped Changes</h3>
 
 {{ range .UnmappedChanges -}}
 
 <details>
-<summary><img width="14" alt="{{ .StatusAlt }}" src="{{ $top.AssetPath }}/{{ .StatusIcon }}"> {{ .Type }} › {{ .Title }}</summary>
+<summary > {{ .StatusSymbol }} {{ .Type }} › {{ .Title }}</summary>
 
 {{ if .Diff -}}
 
@@ -37,27 +69,17 @@ No expected changes found.
 ```
 
 {{ else -}}
-(no changed attributes)
+_No changed attributes_
 {{ end -}}
 
 </details>
 {{ end }}
 {{ end }}
 
-# Blast Radius
+---
 
-| <img width="16" alt="items" src="{{ .AssetPath }}/item.svg"> Items | <img width="16" alt="edges" src="{{ .AssetPath }}/edge.svg"> Edges |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| {{ .BlastItems }}                                                                                                                                       | {{ .BlastEdges }}                                                                                                                                       |
+<h3>💥 Blast Radius</h3>
 
-[Open in Overmind]({{ .ChangeUrl }})
+**Items** ` {{ .BlastItems }} `
 
-{{ if .Risks }}
-# <img width="24" alt="warning" src="{{ .AssetPath }}/risks.svg"> Risks
-
-{{ range .Risks }}
-## <img width="18" alt="{{ .SeverityAlt }}" src="{{ $top.AssetPath }}/{{ .SeverityIcon }}"> {{ .Title }} [{{ .SeverityText }}]
-
-{{ .Description }}
-{{ end }}
-{{ end }}
+**Edges** ` {{ .BlastEdges }} `

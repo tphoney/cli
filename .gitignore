@@ -22,8 +22,6 @@ gon
 go.work
 
 dist/
-tracing/commit.txt
-cmd/commit.txt
 output
 .DS_Store
 .terraform
@@ -31,3 +29,8 @@ overmind.plan
 terraform.tfstate
 terraform.tfstate.backup
 /tmp/
+/node_modules
+__debug_bin*
+
+# ignore local terraform files
+tfplan.json*

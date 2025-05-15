@@ -15,19 +15,41 @@
 
 # What is Overmind?
 
-Overmind is a powerful tool for real-time impact analysis on Terraform changes. Overmind can **identify the blast radius** and **uncover potential risks** with `overmind terrafrom plan` before they harm your infrastructure, allowing anyone to make changes with confidence. We also track the impacts of the changes you make with `overmind teraform apply`, so that you can be sure that your changes haven't had any unexpected downstream impact.
+Overmind is a **tribal knowledge database** that empowers your team to manage infrastructure confidently, even without extensive experience.
+
+### Signs your team needs Overmind
+
+- **Blocked Experts & Slow Onboarding**
+
+  - Expert team members spend too much time on approvals, reducing overall productivity.
+  - Newer staff face a steep learning curve, delaying their effectiveness.
+
+- **Limited Dependency Visibility**
+
+  - Tools like Terraform show intended changes but don't reveal underlying dependencies.
+  - Difficulty in assessing whether changes will disrupt existing applications.
+- **Complex Outage Troubleshooting**
+
+  - Pinpointing issues during outages is challenging due to hidden dependencies.
+  - Outages often result from intricate, unforeseen relationships rather than simple cause-and-effect.
 
 # Quick Start
 
 Install the Overmind CLI using brew:
 
-```
+```shell
 brew install overmindtech/overmind/overmind-cli
+```
+
+Launch the assistant and explore your newly configured AWS source:
+
+```shell
+overmind explore
 ```
 
 Run a terraform plan:
 
-```
+```shell
 overmind terraform plan
 ```
 
@@ -48,7 +70,7 @@ overmind terraform plan
 
 To install on Mac with homebrew use:
 
-```
+```shell
 brew install overmindtech/overmind/overmind-cli
 ```
 
@@ -75,15 +97,22 @@ curl -1sLf \
 Or set it up manually
 
 ```shell
+# NOTE: For Debian Stretch, Ubuntu 16.04 and later
+keyring_location=/usr/share/keyrings/overmind-tools-archive-keyring.gpg
+# NOTE: For Debian Jessie, Ubuntu 15.10 and earlier
+keyring_location=/etc/apt/trusted.gpg.d/overmind-tools.gpg
+
+# Capture the codename
+codename=$(lsb_release -cs)
+
 apt-get install -y debian-keyring  # debian only
 apt-get install -y debian-archive-keyring  # debian only
+
 apt-get install -y apt-transport-https
-# For Debian Stretch, Ubuntu 16.04 and later
-keyring_location=/usr/share/keyrings/overmind-tools-archive-keyring.gpg
-# For Debian Jessie, Ubuntu 15.10 and earlier
-keyring_location=/etc/apt/trusted.gpg.d/overmind-tools.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/overmind/tools/gpg.BC5CDEFB4E37A1B3.key' |  gpg --dearmor >> ${keyring_location}
-curl -1sLf 'https://dl.cloudsmith.io/public/overmind/tools/config.deb.txt?distro=ubuntu&codename=xenial&component=main' > /etc/apt/sources.list.d/overmind-tools.list
+curl -1sLf 'https://dl.cloudsmith.io/public/overmind/tools/config.deb.txt?distro=ubuntu&$codename=xenial&component=main' > /etc/apt/sources.list.d/overmind-tools.list
+chmod 0644 /etc/apt/sources.list.d/overmind-tools.list
+chmod 0644 /usr/share/keyrings/overmind-tools-archive-keyring.gpg
 apt-get update
 ```
 
@@ -150,16 +179,41 @@ Packages for Arch are available on the [releases page](https://github.com/overmi
 
 Additionally a community maintained package can be found in the [aur](https://aur.archlinux.org/packages/overmind-cli-bin).
 
+### ASDF
+
+Overmind can be installed using [asdf](https://asdf-vm.com/):
+
+```shell
+# Add the plugin
+asdf plugin add overmind-cli https://github.com/overmindtech/asdf-overmind-cli.git
+
+# Show all installable versions
+asdf list-all overmind-cli
+
+# Install specific version
+asdf install overmind-cli latest
+
+# Set a version globally (on your ~/.tool-versions file)
+asdf global overmind-cli latest
+
+# Now overmind-cli commands are available
+overmind --version
+```
+
 </details>
 
-## Why Use Overmind?
+**Discover CLI Commands**
 
-* **☁️ Cloud Complexity:** Terraform tells you what it's going to change, but not whether this change will break everything. Teams need to understand dependencies to properly understand impact.
-* **👨‍🏫 Onboarding & Productivity:** Due to the reliance on "tribal knowledge", expert staff are stuck doing approvals rather than productive work and newer staff take longer to become productive.
-* **📋 Change Management Process:** IaC and automation mean that changes spend substantially more time in review and approval steps than the change itself actually takes.
-* **🔥 Downtime:** Outages are not caused by simple cause-and-effect relationships. More often than not, downtime is a result of dependencies people didn't know existed.
+- `overmind explore`
+
+    Overmind Assistant is a chat assistant that has real-time access to all your AWS and K8’s infrastructure. It alleviates the mental exhaustion of manual troubleshooting, simplifies incident resolution by easily accessing historical data, and automates time-consuming tasks such as documentation and Terraform code generation. You can access the assistant by running `overmind explore` .
+
+- `overmind terrafrom plan / apply`
+
+    Overmind can identify the blast radius and uncover potential risks with `overmind terrafrom plan` before they harm your infrastructure, allowing anyone to make changes with confidence. It can also track the impact of the changes you make with `overmind teraform apply`, so that you can be sure that your changes haven't had any unexpected downstream impact.
 
 ## How We Solve It?
+
 <table style="width: 100%; table-layout: fixed;">
   <tr>
     <td style="width: 50%; vertical-align: top;">
@@ -205,6 +259,10 @@ overmind terraform plan -- -var-file=production.tfvars -parallelism=20 -auto-app
 ## Reporting Bugs
 
 - Want to report a bug or request a feature? [Open an issue](https://github.com/overmindtech/cli/issues/new)
+
+## Development
+
+Please look in the [CONTRIBUTING.md](https://github.com/overmindtech/cli/blob/main/CONTRIBUTING.md) document.
 
 ## License
 

@@ -3,14 +3,26 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"slices"
 	"strings"
+	"sync/atomic"
+	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"connectrpc.com/connect"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
+	"github.com/muesli/reflow/wordwrap"
+	"github.com/overmindtech/pterm"
+	"github.com/overmindtech/cli/tfutils"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // terraformPlanCmd represents the `terraform plan` command
@@ -18,29 +30,14 @@ var terraformPlanCmd = &cobra.Command{
 	Use:    "plan [overmind options...] -- [terraform options...]",
 	Short:  "Runs `terraform plan` and sends the results to Overmind to calculate a blast radius and risks.",
 	PreRun: PreRunSetup,
-	Run:    CmdWrapper("plan", []string{"explore:read", "changes:write", "config:write", "request:receive"}, NewTfPlanModel),
+	RunE:   TerraformPlan,
 }
 
-type tfPlanModel struct {
-	ctx context.Context // note that this ctx is not initialized on NewTfPlanModel to instead get a modified context through the loadSourcesConfigMsg that has a timeout and cancelFunction configured
-	oi  OvermindInstance
+func TerraformPlan(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
 
-	args        []string
-	planFile    string
-	runPlanTask runPlanModel
+	PTermSetup()
 
-	runPlanFinished       bool
-	revlinkWarmupFinished bool
-
-	submitPlanTask submitPlanModel
-
-	width int
-}
-
-// assert interface
-var _ FinalReportingModel = (*tfPlanModel)(nil)
-
-func NewTfPlanModel(args []string, parent *cmdModel, width int) tea.Model {
 	hasPlanOutSet := false
 	planFile := "overmind.plan"
 	for i, a := range args {
@@ -73,79 +70,380 @@ func NewTfPlanModel(args []string, parent *cmdModel, width int) tea.Model {
 		// TODO: remember whether we used a temporary plan file and remove it when done
 	}
 
-	return tfPlanModel{
-		args:           args,
-		runPlanTask:    NewRunPlanModel(args, planFile, parent, width),
-		submitPlanTask: NewSubmitPlanModel(planFile, width),
-		planFile:       planFile,
+	ctx, oi, _, cleanup, err := StartSources(ctx, cmd, args)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
+
+	return TerraformPlanImpl(ctx, cmd, oi, args, planFile)
 }
 
-func (m tfPlanModel) Init() tea.Cmd {
-	return tea.Batch(
-		m.runPlanTask.Init(),
-		m.submitPlanTask.Init(),
-	)
-}
+func TerraformPlanImpl(ctx context.Context, cmd *cobra.Command, oi sdp.OvermindInstance, args []string, planFile string) error {
+	span := trace.SpanFromContext(ctx)
 
-func (m tfPlanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	cmds := []tea.Cmd{}
+	// this printer will be configured once the terraform plan command has
+	// completed  and the terminal is available again
+	postPlanPrinter := atomic.Pointer[pterm.MultiPrinter]{}
 
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = min(MAX_TERMINAL_WIDTH, msg.Width)
+	revlinkPool := RunRevlinkWarmup(ctx, oi, &postPlanPrinter, args)
 
-	case loadSourcesConfigMsg:
-		m.ctx = msg.ctx
-		m.oi = msg.oi
+	err := RunPlan(ctx, args)
+	if err != nil {
+		return err
+	}
 
-	case revlinkWarmupFinishedMsg:
-		m.revlinkWarmupFinished = true
-		if m.runPlanFinished {
-			cmds = append(cmds, func() tea.Msg { return submitPlanNowMsg{} })
+	log.Debug("done running terraform plan")
+
+	// start showing revlink warmup status now that the terminal is free
+	multi := pterm.DefaultMultiPrinter
+	_, _ = multi.Start()
+	defer func() {
+		_, _ = multi.Stop()
+	}()
+
+	// create a spinner for removing secrets before publishing `multi` to the
+	// postPlanPrinter, so that "removing secrets" is shown before the revlink
+	// status updates
+	removingSecretsSpinner, _ := pterm.DefaultSpinner.WithWriter(multi.NewWriter()).Start("Removing secrets")
+	postPlanPrinter.Store(&multi)
+
+	///////////////////////////////////////////////////////////////////
+	// Convert provided plan into JSON for easier parsing
+	///////////////////////////////////////////////////////////////////
+
+	tfPlanJsonCmd := exec.CommandContext(ctx, "terraform", "show", "-json", planFile)
+
+	tfPlanJsonCmd.Stderr = multi.NewWriter() // send output through PTerm; is usually empty
+
+	log.WithField("args", tfPlanJsonCmd.Args).Debug("converting plan to JSON")
+	planJson, err := tfPlanJsonCmd.Output()
+	if err != nil {
+		removingSecretsSpinner.Fail(fmt.Sprintf("Removing secrets: %v", err))
+		return fmt.Errorf("failed to convert terraform plan to JSON: %w", err)
+	}
+
+	removingSecretsSpinner.Success()
+
+	///////////////////////////////////////////////////////////////////
+	// Extract changes from the plan and created mapped item diffs
+	///////////////////////////////////////////////////////////////////
+
+	resourceExtractionSpinner, _ := pterm.DefaultSpinner.WithWriter(multi.NewWriter()).Start("Extracting resources")
+	resourceExtractionResults := multi.NewWriter()
+	time.Sleep(200 * time.Millisecond) // give the UI a little time to update
+
+	// Map the terraform changes to Overmind queries
+	mappingResponse, err := tfutils.MappedItemDiffsFromPlan(ctx, planJson, planFile, log.Fields{})
+	if err != nil {
+		resourceExtractionSpinner.Fail(fmt.Sprintf("Removing secrets: %v", err))
+		return nil
+	}
+
+	removingSecretsSpinner.Success(fmt.Sprintf("Removed %v secrets", mappingResponse.RemovedSecrets))
+
+	resourceExtractionSpinner.UpdateText(fmt.Sprintf("Extracted %v changing resources: %v supported %v skipped %v unsupported\n",
+		mappingResponse.NumTotal(),
+		mappingResponse.NumSuccess(),
+		mappingResponse.NumNotEnoughInfo(),
+		mappingResponse.NumUnsupported(),
+	))
+
+	// Sort the supported and unsupported changes so that they display nicely
+	slices.SortFunc(mappingResponse.Results, func(a, b tfutils.PlannedChangeMapResult) int {
+		return int(a.Status) - int(b.Status)
+	})
+
+	// render the list of supported and unsupported changes for the UI
+	for _, mapping := range mappingResponse.Results {
+		var printer pterm.PrefixPrinter
+		switch mapping.Status {
+		case tfutils.MapStatusSuccess:
+			printer = pterm.Success
+		case tfutils.MapStatusNotEnoughInfo:
+			printer = pterm.Warning
+		case tfutils.MapStatusUnsupported:
+			printer = pterm.Error
 		}
-	case runPlanFinishedMsg:
-		cmds = append(cmds, func() tea.Msg { return hideStartupStatusMsg{} })
-		if msg.err != nil {
-			cmds = append(cmds, func() tea.Msg { return fatalError{err: msg.err} })
-		} else {
-			m.runPlanFinished = true
-			if m.revlinkWarmupFinished {
-				cmds = append(cmds, func() tea.Msg { return submitPlanNowMsg{} })
+
+		line := printer.Sprintf("%v (%v)", mapping.TerraformName, mapping.Message)
+		_, err = fmt.Fprintf(resourceExtractionResults, "   %v\n", line)
+		if err != nil {
+			return fmt.Errorf("error writing to resource extraction results: %w", err)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond) // give the UI a little time to update
+
+	resourceExtractionSpinner.Success()
+
+	// wait for the revlink warmup for 15 seconds. if it takes longer, we'll just continue
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- revlinkPool.Wait()
+	}()
+
+	select {
+	case err = <-waitCh:
+		if err != nil {
+			return fmt.Errorf("error waiting for revlink warmup: %w", err)
+		}
+	case <-time.After(15 * time.Second):
+		pterm.Info.Print("Done waiting for revlink warmup")
+	}
+
+	///////////////////////////////////////////////////////////////////
+	// try to link up the plan with a Change and start submitting to the API
+	///////////////////////////////////////////////////////////////////
+
+	uploadChangesSpinner, _ := pterm.DefaultSpinner.WithWriter(multi.NewWriter()).Start("Uploading planned changes")
+
+	ticketLink := viper.GetString("ticket-link")
+	if ticketLink == "" {
+		ticketLink, err = getTicketLinkFromPlan(planFile)
+		if err != nil {
+			uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed to get ticket link from plan: %v", err))
+			return nil
+		}
+	}
+
+	client := AuthenticatedChangesClient(ctx, oi)
+	changeUuid, err := getChangeUuid(ctx, oi, sdp.ChangeStatus_CHANGE_STATUS_DEFINING, ticketLink, false)
+	if err != nil {
+		uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed searching for existing changes: %v", err))
+		return nil
+	}
+
+	title := changeTitle(viper.GetString("title"))
+	tfPlanTextCmd := exec.CommandContext(ctx, "terraform", "show", planFile)
+
+	tfPlanTextCmd.Stderr = multi.NewWriter() // send output through PTerm; is usually empty
+
+	log.WithField("args", tfPlanTextCmd.Args).Debug("pretty-printing plan")
+	tfPlanOutput, err := tfPlanTextCmd.Output()
+	if err != nil {
+		uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed to pretty-print plan: %v", err))
+		return nil
+	}
+
+	codeChangesOutput := tryLoadText(ctx, viper.GetString("code-changes-diff"))
+
+	// Detect the repository URL if it wasn't provided
+	repoUrl := viper.GetString("repo")
+	if repoUrl == "" {
+		repoUrl, _ = DetectRepoURL(AllDetectors)
+	}
+	enrichedTags, err := parseTagsArgument()
+	if err != nil {
+		uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed to parse tags: %v", err))
+		return nil
+	}
+
+	properties := &sdp.ChangeProperties{
+		Title:        title,
+		Description:  viper.GetString("description"),
+		TicketLink:   ticketLink,
+		Owner:        viper.GetString("owner"),
+		RawPlan:      string(tfPlanOutput),
+		CodeChanges:  codeChangesOutput,
+		Repo:         repoUrl,
+		EnrichedTags: enrichedTags,
+	}
+
+	if changeUuid == uuid.Nil {
+		uploadChangesSpinner.UpdateText("Uploading planned changes (new)")
+		log.Debug("Creating a new change")
+		createResponse, err := client.CreateChange(ctx, &connect.Request[sdp.CreateChangeRequest]{
+			Msg: &sdp.CreateChangeRequest{
+				Properties: properties,
+			},
+		})
+		if err != nil {
+			uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed to create a new change: %v", err))
+			return nil
+		}
+
+		maybeChangeUuid := createResponse.Msg.GetChange().GetMetadata().GetUUIDParsed()
+		if maybeChangeUuid == nil {
+			uploadChangesSpinner.Fail("Uploading planned changes: failed to read change id")
+			return nil
+		}
+
+		changeUuid = *maybeChangeUuid
+		span.SetAttributes(
+			attribute.String("ovm.change.uuid", changeUuid.String()),
+			attribute.Bool("ovm.change.new", true),
+		)
+	} else {
+		uploadChangesSpinner.UpdateText("Uploading planned changes (update)")
+		log.WithField("change", changeUuid).Debug("Updating an existing change")
+
+		_, err := client.UpdateChange(ctx, &connect.Request[sdp.UpdateChangeRequest]{
+			Msg: &sdp.UpdateChangeRequest{
+				UUID:       changeUuid[:],
+				Properties: properties,
+			},
+		})
+		if err != nil {
+			uploadChangesSpinner.Fail(fmt.Sprintf("Uploading planned changes: failed to update change: %v", err))
+			return nil
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // give the UI a little time to update
+	uploadChangesSpinner.Success()
+
+	///////////////////////////////////////////////////////////////////
+	// Upload the planned changes to the API
+	///////////////////////////////////////////////////////////////////
+
+	uploadPlannedChange, _ := pterm.DefaultSpinner.WithWriter(multi.NewWriter()).Start("Uploading planned changes")
+	log.WithField("change", changeUuid).Debug("Uploading planned changes")
+
+	_, err = client.StartChangeAnalysis(ctx, &connect.Request[sdp.StartChangeAnalysisRequest]{
+		Msg: &sdp.StartChangeAnalysisRequest{
+			ChangeUUID:    changeUuid[:],
+			ChangingItems: mappingResponse.GetItemDiffs(),
+		},
+	})
+	if err != nil {
+		uploadPlannedChange.Fail(fmt.Sprintf("Uploading planned changes: failed to update: %v", err))
+		return nil
+	}
+	uploadPlannedChange.Success("Uploaded planned changes: Done")
+
+	changeUrl := *oi.FrontendUrl
+	changeUrl.Path = fmt.Sprintf("%v/changes/%v/blast-radius", changeUrl.Path, changeUuid)
+	log.WithField("change-url", changeUrl.String()).Info("Change ready")
+
+	///////////////////////////////////////////////////////////////////
+	// wait for change analysis to complete
+	///////////////////////////////////////////////////////////////////
+	changeAnalysisSpinner, _ := pterm.DefaultSpinner.WithWriter(multi.NewWriter()).Start("Change Analysis")
+
+	var timeLine *sdp.GetChangeTimelineV2Response
+	milestoneSpinners := []*pterm.SpinnerPrinter{}
+retryLoop:
+	for {
+		rawTimeLine, timelineErr := client.GetChangeTimelineV2(ctx, &connect.Request[sdp.GetChangeTimelineV2Request]{
+			Msg: &sdp.GetChangeTimelineV2Request{
+				ChangeUUID: changeUuid[:],
+			},
+		})
+		if timelineErr != nil || rawTimeLine.Msg == nil {
+			changeAnalysisSpinner.Fail(fmt.Sprintf("Change Analysis failed to get timeline: %v", timelineErr))
+			return nil
+		}
+		timeLine = rawTimeLine.Msg
+
+		// display the status for the timeline entries
+		for i, entry := range timeLine.GetEntries() {
+			// populate the spinner list on the first run
+			if i <= len(milestoneSpinners) {
+				milestoneSpinners = append(milestoneSpinners, pterm.DefaultSpinner.
+					WithWriter(multi.NewWriter()).
+					WithIndentation(IndentSymbol()).
+					WithText(entry.GetName()))
+			}
+			// render the spinner for this entry
+			switch entry.GetStatus() {
+			case sdp.ChangeTimelineEntryStatus_PENDING:
+				continue
+			case sdp.ChangeTimelineEntryStatus_IN_PROGRESS:
+				if !milestoneSpinners[i].IsActive {
+					milestoneSpinners[i], _ = milestoneSpinners[i].Start()
+				}
+			case sdp.ChangeTimelineEntryStatus_ERROR:
+				milestoneSpinners[i].Fail()
+			case sdp.ChangeTimelineEntryStatus_DONE:
+				milestoneSpinners[i].Success()
+			case sdp.ChangeTimelineEntryStatus_UNSPECIFIED:
+				// do nothing
+			default:
+				milestoneSpinners[i].Fail(fmt.Sprintf("Unknown status: %v", entry.GetStatus()))
+			}
+
+			// check if change analysis is done
+			if entry.GetName() == string(sdp.ChangeTimelineEntryV2NameAutoTagging) && entry.GetStatus() == sdp.ChangeTimelineEntryStatus_DONE {
+				changeAnalysisSpinner.Success()
+				break retryLoop
 			}
 		}
-
-	case submitPlanFinishedMsg:
-		cmds = append(cmds, func() tea.Msg { return delayQuitMsg{} })
+		// retry
+		time.Sleep(3 * time.Second)
+	}
+	var calculateRiskStep *sdp.ChangeTimelineEntryV2
+	for _, entry := range timeLine.GetEntries() {
+		if entry.GetName() == string(sdp.ChangeTimelineEntryV2NameCalculatedRisks) {
+			calculateRiskStep = entry
+			break
+		}
+	}
+	if calculateRiskStep == nil || calculateRiskStep.GetCalculatedRisks() == nil {
+		return fmt.Errorf("Failed to get calculated risks")
+	}
+	calculatedRisks := calculateRiskStep.GetCalculatedRisks().GetRisks()
+	// Submit milestone for tracing
+	if cmdSpan != nil {
+		cmdSpan.AddEvent("Change Analysis finished", trace.WithAttributes(
+			attribute.Int("ovm.risks.count", len(calculatedRisks)),
+			attribute.String("ovm.change.uuid", changeUuid.String()),
+		))
 	}
 
-	rpm, cmd := m.runPlanTask.Update(msg)
-	m.runPlanTask = rpm.(runPlanModel)
-	cmds = append(cmds, cmd)
-
-	spm, cmd := m.submitPlanTask.Update(msg)
-	m.submitPlanTask = spm.(submitPlanModel)
-	cmds = append(cmds, cmd)
-
-	return m, tea.Batch(cmds...)
-}
-
-func (m tfPlanModel) View() string {
 	bits := []string{}
+	bits = append(bits, "")
+	bits = append(bits, "")
+	if len(calculatedRisks) == 0 {
+		bits = append(bits, styleH1().Render("Potential Risks"))
+		bits = append(bits, "")
+		bits = append(bits, "Overmind has not identified any risks associated with this change.")
+		bits = append(bits, "")
+		bits = append(bits, "This could be due to the change being low risk with no impact on other parts of the system, or involving resources that Overmind currently does not support.")
+	} else if changeUrl.String() != "" {
+		bits = append(bits, styleH1().Render("Potential Risks"))
+		bits = append(bits, "")
+		for _, r := range calculatedRisks {
+			severity := ""
+			switch r.GetSeverity() {
+			case sdp.Risk_SEVERITY_HIGH:
+				severity = lipgloss.NewStyle().
+					Background(ColorPalette.BgDanger).
+					Foreground(ColorPalette.LabelTitle).
+					Padding(0, 1).
+					Bold(true).
+					Render("High ‼")
+			case sdp.Risk_SEVERITY_MEDIUM:
+				severity = lipgloss.NewStyle().
+					Background(ColorPalette.BgWarning).
+					Foreground(ColorPalette.LabelTitle).
+					Padding(0, 1).
+					Render("Medium !")
+			case sdp.Risk_SEVERITY_LOW:
+				severity = lipgloss.NewStyle().
+					Background(ColorPalette.LabelBase).
+					Foreground(ColorPalette.LabelTitle).
+					Padding(0, 1).
+					Render("Low ⓘ ")
+			case sdp.Risk_SEVERITY_UNSPECIFIED:
+				// do nothing
+			}
+			title := lipgloss.NewStyle().
+				Foreground(ColorPalette.BgMain).
+				PaddingRight(1).
+				Bold(true).
+				Render(r.GetTitle())
 
-	if m.runPlanTask.status != taskStatusPending {
-		bits = append(bits, m.runPlanTask.View())
+			bits = append(bits, (fmt.Sprintf("%v%v\n\n%v\n\n",
+				title,
+				severity,
+				wordwrap.String(r.GetDescription(), min(160, pterm.GetTerminalWidth()-4)))))
+		}
+		bits = append(bits, fmt.Sprintf("\nCheck the blast radius graph and risks at:\n%v\n\n", changeUrl.String()))
 	}
 
-	if m.submitPlanTask.Status() != taskStatusPending {
-		bits = append(bits, m.submitPlanTask.View())
-	}
+	pterm.Fprintln(multi.NewWriter(), strings.Join(bits, "\n"))
 
-	return strings.Join(bits, "\n") + "\n"
-}
-
-func (m tfPlanModel) FinalReport() string {
-	return m.submitPlanTask.FinalReport()
+	return nil
 }
 
 // getTicketLinkFromPlan reads the plan file to create a unique hash to identify this change
@@ -159,91 +457,6 @@ func getTicketLinkFromPlan(planFile string) (string, error) {
 	return fmt.Sprintf("tfplan://{SHA256}%x", h.Sum(nil)), nil
 }
 
-func countSensitiveValuesInConfig(m ConfigModule) int {
-	removedSecrets := 0
-	for _, v := range m.Variables {
-		if v.Sensitive {
-			removedSecrets++
-		}
-	}
-	for _, o := range m.Outputs {
-		if o.Sensitive {
-			removedSecrets++
-		}
-	}
-	for _, c := range m.ModuleCalls {
-		removedSecrets += countSensitiveValuesInConfig(c.Module)
-	}
-	return removedSecrets
-}
-
-func countSensitiveValuesInState(m Module) int {
-	removedSecrets := 0
-	for _, r := range m.Resources {
-		removedSecrets += countSensitiveValuesInResource(r)
-	}
-	for _, c := range m.ChildModules {
-		removedSecrets += countSensitiveValuesInState(c)
-	}
-	return removedSecrets
-}
-
-// follow itemAttributesFromResourceChangeData and maskSensitiveData
-// implementation to count sensitive values
-func countSensitiveValuesInResource(r Resource) int {
-	// sensitiveMsg can be a bool or a map[string]any
-	var isSensitive bool
-	err := json.Unmarshal(r.SensitiveValues, &isSensitive)
-	if err == nil && isSensitive {
-		return 1 // one very large secret
-	} else if err != nil {
-		// only try parsing as map if parsing as bool failed
-		var sensitive map[string]any
-		err = json.Unmarshal(r.SensitiveValues, &sensitive)
-		if err != nil {
-			return 0
-		}
-		return countSensitiveAttributes(r.AttributeValues, sensitive)
-	}
-	return 0
-}
-
-func countSensitiveAttributes(attributes, sensitive any) int {
-	if sensitive == true {
-		return 1
-	} else if sensitiveMap, ok := sensitive.(map[string]any); ok {
-		if attributesMap, ok := attributes.(map[string]any); ok {
-			result := 0
-			for k, v := range attributesMap {
-				result += countSensitiveAttributes(v, sensitiveMap[k])
-			}
-			return result
-		} else {
-			return 1
-		}
-	} else if sensitiveArr, ok := sensitive.([]any); ok {
-		if attributesArr, ok := attributes.([]any); ok {
-			if len(sensitiveArr) != len(attributesArr) {
-				return 1
-			}
-			result := 0
-			for i, v := range attributesArr {
-				result += countSensitiveAttributes(v, sensitiveArr[i])
-			}
-			return result
-		} else {
-			return 1
-		}
-	}
-	return 0
-}
-
-func addTerraformBaseFlags(cmd *cobra.Command) {
-	cmd.PersistentFlags().Bool("reset-stored-config", false, "Set this to reset the sources config stored in Overmind and input fresh values.")
-	cmd.PersistentFlags().String("aws-config", "", "The chosen AWS config method, best set through the initial wizard when running the CLI. Options: 'profile_input', 'aws_profile', 'defaults', 'managed'.")
-	cmd.PersistentFlags().String("aws-profile", "", "Set this to the name of the AWS profile to use.")
-}
-
 func init() {
 	terraformCmd.AddCommand(terraformPlanCmd)
 
@@ -251,7 +464,3 @@ func init() {
 	addChangeUuidFlags(terraformPlanCmd)
 	addTerraformBaseFlags(terraformPlanCmd)
 }
-
-const TEST_RISK = `In publishing and graphic design, Lorem ipsum (/ˌlɔː.rəm ˈɪp.səm/) is a placeholder text commonly used to demonstrate the visual form of a document or a typeface without relying on meaningful content. Lorem ipsum may be used as a placeholder before the final copy is available. It is also used to temporarily replace text in a process called greeking, which allows designers to consider the form of a webpage or publication, without the meaning of the text influencing the design.
-
-Lorem ipsum is typically a corrupted version of De finibus bonorum et malorum, a 1st-century BC text by the Roman statesman and philosopher Cicero, with words altered, added, and removed to make it nonsensical and improper Latin. The first two words themselves are a truncation of dolorem ipsum ("pain itself").`

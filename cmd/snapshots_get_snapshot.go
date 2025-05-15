@@ -6,7 +6,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -28,7 +28,7 @@ func GetSnapshot(cmd *cobra.Command, args []string) error {
 		return flagError{usage: fmt.Sprintf("invalid --uuid value '%v', error: %v\n\n%v", viper.GetString("uuid"), err, cmd.UsageString())}
 	}
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"explore:read", "changes:read"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"explore:read", "changes:read"}, nil)
 	if err != nil {
 		return err
 	}
@@ -55,11 +55,6 @@ func GetSnapshot(cmd *cobra.Command, args []string) error {
 		log.WithContext(ctx).WithFields(log.Fields{
 			"snapshot-query": q,
 		}).Info("found snapshot query")
-	}
-	for _, i := range response.Msg.GetSnapshot().GetProperties().GetExcludedItems() {
-		log.WithContext(ctx).WithFields(log.Fields{
-			"snapshot-excluded-item": i,
-		}).Info("found snapshot excluded item")
 	}
 	for _, i := range response.Msg.GetSnapshot().GetProperties().GetItems() {
 		log.WithContext(ctx).WithFields(log.Fields{

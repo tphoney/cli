@@ -1,274 +1,83 @@
 package cmd
 
 import (
-	"context"
-	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
-
-	"github.com/overmindtech/sdp-go"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/require"
 )
 
-func TestWithStateFile(t *testing.T) {
-	_, err := mappedItemDiffsFromPlanFile(context.Background(), "testdata/state.json", logrus.Fields{})
-
-	if err == nil {
-		t.Error("Expected error when running with state file, got none")
-	}
-}
-
-// note that these tests need to allocate the input map for every test to avoid
-// false positives from maskSensitiveData mutating the data
-func TestMaskSensitiveData(t *testing.T) {
-	t.Parallel()
-
-	t.Run("empty", func(t *testing.T) {
-		t.Parallel()
-		got := maskSensitiveData(map[string]any{}, map[string]any{})
-		require.Equal(t, map[string]any{}, got)
-	})
-
-	t.Run("easy", func(t *testing.T) {
-		t.Parallel()
-		require.Equal(t,
-			map[string]any{
-				"foo": "bar",
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": "bar",
-				},
-				map[string]any{}))
-
-		require.Equal(t,
-			map[string]any{
-				"foo": "REDACTED",
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": "bar",
-				},
-				map[string]any{"foo": true}))
-
-	})
-
-	t.Run("deep", func(t *testing.T) {
-		t.Parallel()
-		require.Equal(t,
-			map[string]any{
-				"foo": map[string]any{"key": "bar"},
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": map[string]any{"key": "bar"},
-				},
-				map[string]any{}))
-
-		require.Equal(t,
-			map[string]any{
-				"foo": "REDACTED",
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": map[string]any{"key": "bar"},
-				},
-				map[string]any{"foo": true}))
-
-		require.Equal(t,
-			map[string]any{
-				"foo": map[string]any{"key": "REDACTED"},
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": map[string]any{"key": "bar"},
-				},
-				map[string]any{"foo": map[string]any{"key": true}}))
-
-	})
-
-	t.Run("arrays", func(t *testing.T) {
-		t.Parallel()
-		require.Equal(t,
-			map[string]any{
-				"foo": []any{"one", "two"},
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": []any{"one", "two"},
-				},
-				map[string]any{}))
-
-		require.Equal(t,
-			map[string]any{
-				"foo": "REDACTED",
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": []any{"one", "two"},
-				},
-				map[string]any{"foo": true}))
-
-		require.Equal(t,
-			map[string]any{
-				"foo": []any{"one", "REDACTED"},
-			},
-			maskSensitiveData(
-				map[string]any{
-					"foo": []any{"one", "two"},
-				},
-				map[string]any{"foo": []any{false, true}}))
-
-	})
-}
-
-func TestExtractProviderNameFromConfigKey(t *testing.T) {
+func TestLoadAutoTagRulesFile(t *testing.T) {
 	tests := []struct {
-		ConfigKey string
-		Expected  string
+		name          string
+		fileContent   string
+		errorContains string
+		numberOfRules int
 	}{
 		{
-			ConfigKey: "kubernetes",
-			Expected:  "kubernetes",
+			name:          "NonExistent.yaml",
+			fileContent:   "",
+			errorContains: "does not exist",
 		},
 		{
-			ConfigKey: "module.core:kubernetes",
-			Expected:  "kubernetes",
+			name:          "FailedToParse.yaml",
+			fileContent:   "invalid yaml content",
+			errorContains: "Failed to parse",
+		},
+		{
+			name:          "MoreThan10Rules.yaml",
+			fileContent:   generateRules(11),
+			errorContains: "10 rules",
+		},
+		{
+			name:          "ValidRules.yaml",
+			fileContent:   generateRules(5),
+			errorContains: "there should be no error",
+			numberOfRules: 5,
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.ConfigKey, func(t *testing.T) {
-			actual := extractProviderNameFromConfigKey(test.ConfigKey)
-			if actual != test.Expected {
-				t.Errorf("Expected %v, got %v", test.Expected, actual)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := tt.name
+			if tt.fileContent != "" {
+				err := os.WriteFile(filePath, []byte(tt.fileContent), 0644)
+				if err != nil {
+					t.Errorf("Failed to write file %q: %v", filePath, err)
+				}
+				defer os.Remove(filePath)
+			}
+
+			result, err := loadAutoTagRulesFile(filePath)
+			if err != nil && !strings.Contains(err.Error(), tt.errorContains) {
+				t.Errorf("Expected error\n%q\nto contain\n%q", err.Error(), tt.errorContains)
+			}
+			if tt.numberOfRules > 0 {
+
+				if len(result) != tt.numberOfRules {
+					t.Errorf("Expected %d rules, got %d", tt.numberOfRules, len(result))
+				}
 			}
 		})
 	}
 }
 
-func TestRemoveKnownAfterApply(t *testing.T) {
-	before, err := sdp.ToAttributes(map[string]interface{}{
-		"string_value": "foo",
-		"int_value":    42,
-		"bool_value":   true,
-		"float_value":  3.14,
-		"list_value": []interface{}{
-			"foo",
-			"bar",
-		},
-		"map_value": map[string]interface{}{
-			"foo": "bar",
-			"bar": "baz",
-		},
-		"map_value2": map[string]interface{}{
-			"ding": map[string]interface{}{
-				"foo": "bar",
-			},
-		},
-		"nested_list": []interface{}{
-			[]interface{}{},
-			[]interface{}{
-				"foo",
-				"bar",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
+func generateRules(count int) string {
+	rules := "rules:"
+	rules += `
+  - name: rule0
+    tag_key: key0
+    enabled: true
+    instructions: Instructions for rule 0
+    valid_values:
+      - value 0`
+	for i := 1; i < count; i++ {
+		rules += fmt.Sprintf(`
+  - name: rule%d
+    tag_key: key%d
+    enabled: true
+    instructions: Instructions for rule %d
+    valid_values: ["value %d"]`, i, i, i, i)
 	}
-
-	after, err := sdp.ToAttributes(map[string]interface{}{
-		"string_value": "bar", // I want to see a diff here
-		"int_value":    nil,   // These are going to be known after apply
-		"bool_value":   nil,   // These are going to be known after apply
-		"float_value":  3.14,
-		"list_value": []interface{}{
-			"foo",
-			"bar",
-			"baz", // So is this one
-		},
-		"map_value": map[string]interface{}{ // This whole thing will be known after apply
-			"foo": "bar",
-		},
-		"map_value2": map[string]interface{}{
-			"ding": map[string]interface{}{
-				"foo": nil, // This will be known after apply
-			},
-		},
-		"nested_list": []interface{}{
-			[]interface{}{
-				"foo",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	afterUnknown := json.RawMessage(`{
-		"int_value": true,
-		"bool_value": true,
-		"float_value": false,
-		"list_value": [
-			false,
-			false,
-			true
-		],
-		"map_value": true,
-		"map_value2": {
-			"ding": {
-				"foo": true
-			}
-		},
-		"nested_list": [
-			[
-				false,
-				true
-			],
-			[
-				false,
-				true
-			]
-		]
-	}`)
-
-	err = removeKnownAfterApply(before, after, afterUnknown)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := before.Get("int_value"); err == nil {
-		t.Errorf("Expected int_value to be removed from the before, but it's still there")
-	}
-
-	if _, err := before.Get("bool_value"); err == nil {
-		t.Errorf("Expected bool_value to be removed from the before, but it's still there")
-	}
-
-	if _, err := after.Get("int_value"); err == nil {
-		t.Errorf("Expected int_value to be removed from the after, but it's still there")
-	}
-
-	if _, err := after.Get("bool_value"); err == nil {
-		t.Errorf("Expected bool_value to be removed from the after, but it's still there")
-	}
-
-	if list, err := before.Get("list_value"); err != nil {
-		t.Errorf("Expected list_value to be there, but it's not: %v", err)
-	} else {
-
-		if len(list.([]interface{})) != 2 {
-			t.Error("Expected list_value to have 2 elements")
-		}
-	}
-
-	if list, err := after.Get("list_value"); err != nil {
-		t.Errorf("Expected list_value to be there, but it's not: %v", err)
-	} else {
-		if len(list.([]interface{})) != 2 {
-			t.Error("Expected list_value to have 2 elements")
-		}
-	}
-
+	return rules
 }

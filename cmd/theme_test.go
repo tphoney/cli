@@ -11,5 +11,9 @@ func TestMarkdownToString(t *testing.T) {
 	got := markdownToString(0, markdown)
 	if got != expectedOutput {
 		t.Errorf("Expected %q, but got %q", expectedOutput, got)
+		t.Log("Expected output:")
+		t.Log(expectedOutput)
+		t.Log("Got output:")
+		t.Log(got)
 	}
 }

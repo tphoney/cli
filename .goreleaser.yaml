@@ -1,12 +1,5 @@
-# This is an example .goreleaser.yml file with some sensible defaults.
 # Make sure to check the documentation at https://goreleaser.com
 version: 2
-before:
-  hooks:
-    # You may remove this if you don't use go modules.
-    - go mod tidy
-    # you may remove this if you don't need go generate
-    - go generate ./...
 builds:
   - binary: overmind
     id: overmind
@@ -15,19 +8,23 @@ builds:
     goos:
       - linux
       - windows
+    ldflags:
+      - -s -w -X github.com/overmindtech/cli/tracing.version={{.Version}}
   - binary: overmind
     id: overmind-macos
     env:
       - CGO_ENABLED=0
     goos:
       - darwin
+    ldflags:
+      - -s -w -X github.com/overmindtech/cli/tracing.version={{.Version}}
 
 # For now we are going to disable signing MacOS packages. This works on Dylan's
 # person laptop, but we haven't worked out a way to get this set up in a github
 # action yet.
 # signs:
 #   - id: amd64
-#     signature: "overmind-cli-amd64.dmg" 
+#     signature: "overmind-cli-amd64.dmg"
 #     ids:
 #       - overmind-macos # here we filter the macos only build id
 #     cmd: ./gon
@@ -147,7 +144,7 @@ checksum:
   name_template: "checksums.txt"
 
 snapshot:
-  name_template: "{{ incpatch .Version }}-next"
+  version_template: "{{ incpatch .Version }}-next"
 
 changelog:
   sort: asc

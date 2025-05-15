@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"time"
+
 	"connectrpc.com/connect"
-	"github.com/overmindtech/sdp-go"
+	"github.com/overmindtech/cli/sdp-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -19,7 +21,7 @@ var endChangeCmd = &cobra.Command{
 func EndChange(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"changes:write"}, nil)
 	if err != nil {
 		return err
 	}
@@ -48,13 +50,18 @@ func EndChange(cmd *cobra.Command, args []string) error {
 		}
 	}
 	log.WithContext(ctx).WithFields(lf).Info("processing")
+	lastLog := time.Now().Add(-1 * time.Minute)
 	for stream.Receive() {
 		msg := stream.Msg()
-		log.WithContext(ctx).WithFields(lf).WithFields(log.Fields{
-			"state": msg.GetState(),
-			"items": msg.GetNumItems(),
-			"edges": msg.GetNumEdges(),
-		}).Info("progress")
+		// print progress every 2 seconds
+		if time.Now().After(lastLog.Add(2 * time.Second)) {
+			log.WithContext(ctx).WithFields(lf).WithFields(log.Fields{
+				"state": msg.GetState(),
+				"items": msg.GetNumItems(),
+				"edges": msg.GetNumEdges(),
+			}).Info("progress")
+			lastLog = time.Now()
+		}
 	}
 	if stream.Err() != nil {
 		return loggedError{

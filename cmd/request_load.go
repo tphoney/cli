@@ -6,8 +6,8 @@ import (
 	"os"
 
 	"github.com/google/uuid"
-	"github.com/overmindtech/sdp-go"
-	"github.com/overmindtech/sdp-go/sdpws"
+	"github.com/overmindtech/cli/sdp-go"
+	"github.com/overmindtech/cli/sdp-go/sdpws"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -44,7 +44,7 @@ func RequestLoad(cmd *cobra.Command, args []string) error {
 		return flagError{fmt.Sprintf("Failed to parse UUID '%v': %v\n\n%v", uuidString, err, cmd.UsageString())}
 	}
 
-	ctx, oi, _, err := login(ctx, cmd, []string{"explore:read", "changes:read"})
+	ctx, oi, _, err := login(ctx, cmd, []string{"explore:read", "changes:read"}, nil)
 	if err != nil {
 		return err
 	}
